@@ -1,0 +1,74 @@
+# Viewfinder
+
+A lightweight Windows capture card viewer. Displays camera output and passes microphone audio through to your speakers with minimal latency.
+
+Built with native Windows APIs — no Electron, no runtime dependencies. Binary is ~135 KB.
+
+## Features
+
+- Live camera preview with correct aspect ratio
+- Microphone audio passthrough (mic → speakers) with automatic format conversion
+- Right-click context menu to switch cameras and microphones
+- Full screen mode
+- Mute toggle
+- Aspect-ratio-locked window resizing
+- Reset window to the camera's native resolution
+
+## Controls
+
+| Input | Action |
+|---|---|
+| Right-click | Open context menu |
+| Double-click | Toggle full screen |
+| F11 | Toggle full screen |
+| Escape | Exit full screen / Quit |
+
+## Building
+
+### Prerequisites
+
+- **Visual Studio 2022** (or later) with the **Desktop development with C++** workload
+  — this includes the MSVC compiler and Windows SDK.
+- **Inno Setup 6** *(optional)* — only needed to produce the installer `.exe`.
+  Download from [jrsoftware.org/isdl.php](https://jrsoftware.org/isdl.php).
+
+### Quick build
+
+Double-click `build.bat`, or run it from any command prompt:
+
+```bat
+cd C:\path\to\viewfinder
+build.bat
+```
+
+The script:
+1. Generates `viewfinder.ico` from `generate_icon.ps1`
+2. Compiles `resources.rc` (embeds the icon into the executable)
+3. Compiles `main.cpp` → `viewfinder.exe`
+4. If Inno Setup 6 is installed, builds `dist\viewfinder-setup.exe`
+
+> **Note:** `build.bat` has the MSVC and Windows SDK paths hard-coded for the
+> machine it was developed on. If the build fails with *cl.exe not found*, open
+> the file and update `MSVC_VER` and `SDK_VER` to match your installation, or
+> use the CMake path below instead.
+
+### CMake build (alternative)
+
+If you have CMake installed:
+
+```bat
+cmake -B build -G "Visual Studio 17 2022"
+cmake --build build --config Release
+```
+
+The resulting executable is at `build\Release\viewfinder.exe`.
+
+## Tech stack
+
+| Layer | API |
+|---|---|
+| Video capture | Windows Media Foundation (`IMFSourceReader`) |
+| Audio passthrough | WASAPI (`IAudioCaptureClient` → `IAudioRenderClient`) |
+| Rendering | GDI (`StretchDIBits`) |
+| Window / UI | Win32 |
+| Installer | Inno Setup 6 |

@@ -1,0 +1,21 @@
+# Build outputs
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+build/
+dist/
+
+# Generated files (recreated by build.bat)
+viewfinder.ico
+
+# Build logs
+build_*.txt
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake

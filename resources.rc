@@ -1,0 +1,5 @@
+// viewfinder resources
+#include <windows.h>
+
+// App icon — referenced as MAKEINTRESOURCE(101) in main.cpp
+101 ICON "viewfinder.ico"
