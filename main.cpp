@@ -32,6 +32,12 @@
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
 
+// DirectWrite (title bar text)
+#include <dwrite.h>
+
+// DWM (window shadow with custom NC area)
+#include <dwmapi.h>
+
 #include <string>
 #include <vector>
 #include <thread>
@@ -54,6 +60,8 @@ using Microsoft::WRL::ComPtr;
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,6 +71,10 @@ static const wchar_t kClassName[]  = L"ViewfinderWnd";
 static const wchar_t kWindowTitle[] = L"Viewfinder";
 
 #define WM_NEW_FRAME   (WM_USER + 1)
+
+static const int kTitleBarH    = 32;  // custom title bar height (pixels)
+static const int kCaptionBtnW  = 46;  // each caption button width
+static const int kResizeBorder = 4;   // resize hit-test border width
 
 #define IDM_CAM_BASE     1000   // 1000–1999: camera items
 #define IDM_MIC_BASE     2000   // 2000–2999: mic items
@@ -149,6 +161,17 @@ static UINT                                   g_vpH = 0;
 // Fullscreen
 static bool             g_fullscreen    = false;
 static WINDOWPLACEMENT  g_savedPlacement = { sizeof(WINDOWPLACEMENT) };
+
+// Custom title bar UI state
+static int  g_hoverBtn      = 0;     // 0=none  1=min  2=max/restore  3=close
+static bool g_mouseTracking = false; // true while TME_LEAVE is registered
+
+// DirectWrite factory + title text format
+static ComPtr<IDWriteFactory>    g_dwFactory;
+static ComPtr<IDWriteTextFormat> g_titleFont;
+
+// Reusable solid brush for UI chrome (created/released with the D2D device)
+static ComPtr<ID2D1SolidColorBrush> g_uiBrush;
 
 // Device lists (rebuilt on every right-click)
 static std::vector<DeviceInfo> g_cameras;
@@ -722,6 +745,7 @@ static void ToggleFullscreen(HWND hwnd)
 // Does NOT release the factory, D3D device, or swap chain — only surface-bound objects.
 static void DiscardD2DResources()
 {
+    g_uiBrush.Reset();
     g_swBitmap.Reset();
     g_swBitmapSize = {};
     g_d2dTarget.Reset();
@@ -847,6 +871,7 @@ static bool SetupSwapChainTarget()
         return false;
 
     g_d2dContext->SetTarget(g_d2dTarget.Get());
+    g_d2dContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &g_uiBrush);
     return true;
 }
 
@@ -950,6 +975,81 @@ static void RenderFrame(HWND /*hwnd*/)
         }
     }
 
+    // ── Caption buttons (top-right, no background) ───────────────────────────
+    // Each icon is drawn twice: first a 2 px dark shadow stroke, then a 1 px
+    // white stroke on top — keeps the glyphs legible over any video content.
+    if (!g_fullscreen && g_uiBrush) {
+        D2D1_SIZE_F rtsz = g_d2dContext->GetSize();
+        const float W    = rtsz.width;
+        const float H    = (float)kTitleBarH;
+        const float BW   = (float)kCaptionBtnW;
+        const float midY = H * 0.5f;
+        const bool  zoomed = (IsZoomed(g_hwnd) != 0);
+
+        // ── Minimize ─────────────────────────────────────────────────────────
+        {
+            float bx = W - BW * 3, cx = bx + BW * 0.5f;
+            if (g_hoverBtn == 1) {
+                g_uiBrush->SetColor(D2D1::ColorF(0.22f, 0.22f, 0.22f));
+                g_d2dContext->FillRectangle(D2D1::RectF(bx, 0, bx + BW, H), g_uiBrush.Get());
+            }
+            g_uiBrush->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f));
+            g_d2dContext->DrawLine(D2D1::Point2F(cx - 5.0f, midY + 0.75f),
+                                   D2D1::Point2F(cx + 5.0f, midY + 0.75f), g_uiBrush.Get(), 2.0f);
+            g_uiBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f));
+            g_d2dContext->DrawLine(D2D1::Point2F(cx - 5.0f, midY),
+                                   D2D1::Point2F(cx + 5.0f, midY), g_uiBrush.Get(), 1.0f);
+        }
+
+        // ── Maximize / Restore ───────────────────────────────────────────────
+        {
+            float bx = W - BW * 2, cx = bx + BW * 0.5f;
+            if (g_hoverBtn == 2) {
+                g_uiBrush->SetColor(D2D1::ColorF(0.22f, 0.22f, 0.22f));
+                g_d2dContext->FillRectangle(D2D1::RectF(bx, 0, bx + BW, H), g_uiBrush.Get());
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                float dy = (pass == 0) ? 0.75f : 0.0f;
+                float sw = (pass == 0) ? 2.0f  : 1.0f;
+                g_uiBrush->SetColor(pass == 0 ? D2D1::ColorF(0.0f, 0.0f, 0.0f)
+                                              : D2D1::ColorF(1.0f, 1.0f, 1.0f));
+                if (zoomed) {
+                    g_d2dContext->DrawRectangle(
+                        D2D1::RectF(cx - 3.0f, midY - 5.5f + dy, cx + 5.5f, midY + 3.0f + dy),
+                        g_uiBrush.Get(), sw);
+                    g_d2dContext->DrawRectangle(
+                        D2D1::RectF(cx - 5.5f, midY - 3.0f + dy, cx + 3.0f, midY + 5.5f + dy),
+                        g_uiBrush.Get(), sw);
+                } else {
+                    g_d2dContext->DrawRectangle(
+                        D2D1::RectF(cx - 5.5f, midY - 5.5f + dy, cx + 5.5f, midY + 5.5f + dy),
+                        g_uiBrush.Get(), sw);
+                }
+            }
+        }
+
+        // ── Close ────────────────────────────────────────────────────────────
+        {
+            float bx = W - BW, cx = bx + BW * 0.5f;
+            if (g_hoverBtn == 3) {
+                g_uiBrush->SetColor(D2D1::ColorF(0.769f, 0.169f, 0.110f));
+                g_d2dContext->FillRectangle(D2D1::RectF(bx, 0, W, H), g_uiBrush.Get());
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                float dy = (pass == 0) ? 0.75f : 0.0f;
+                float sw = (pass == 0) ? 2.0f  : 1.0f;
+                g_uiBrush->SetColor(pass == 0 ? D2D1::ColorF(0.0f, 0.0f, 0.0f)
+                                              : D2D1::ColorF(1.0f, 1.0f, 1.0f));
+                g_d2dContext->DrawLine(
+                    D2D1::Point2F(cx - 5.0f, midY - 5.0f + dy),
+                    D2D1::Point2F(cx + 5.0f, midY + 5.0f + dy), g_uiBrush.Get(), sw);
+                g_d2dContext->DrawLine(
+                    D2D1::Point2F(cx + 5.0f, midY - 5.0f + dy),
+                    D2D1::Point2F(cx - 5.0f, midY + 5.0f + dy), g_uiBrush.Get(), sw);
+            }
+        }
+    }
+
     HRESULT hr = g_d2dContext->EndDraw();
     if (FAILED(hr)) DiscardD2DResources();
 
@@ -1006,6 +1106,63 @@ static void ShowContextMenu(HWND hwnd, int screenX, int screenY)
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
+
+    // Remove the default NC frame so D2D can paint edge-to-edge.
+    // For maximised windows we re-add the invisible resize border so the
+    // client area doesn't bleed under the taskbar.
+    case WM_NCCALCSIZE: {
+        if (!wParam) break;
+        if (IsZoomed(hwnd)) {
+            NCCALCSIZE_PARAMS* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            int bx = GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+            int by = GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+            p->rgrc[0].left   += bx;
+            p->rgrc[0].top    += by;
+            p->rgrc[0].right  -= bx;
+            p->rgrc[0].bottom -= by;
+        }
+        return 0;
+    }
+
+    // Translate cursor position into window regions so DWM / DefWindowProc
+    // can handle dragging, resizing, and caption-button clicks.
+    case WM_NCHITTEST: {
+        if (g_fullscreen) break;
+
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc;
+        GetWindowRect(hwnd, &rc);
+        int x = pt.x - rc.left;
+        int y = pt.y - rc.top;
+        int w = rc.right  - rc.left;
+        int h = rc.bottom - rc.top;
+
+        bool maximized = (IsZoomed(hwnd) != 0);
+        int  bdr       = maximized ? 0 : kResizeBorder;
+
+        if (y < bdr && x < bdr)            return HTTOPLEFT;
+        if (y < bdr && x >= w - bdr)       return HTTOPRIGHT;
+        if (y >= h - bdr && x < bdr)       return HTBOTTOMLEFT;
+        if (y >= h - bdr && x >= w - bdr)  return HTBOTTOMRIGHT;
+        if (y < bdr)                        return HTTOP;
+        if (y >= h - bdr)                   return HTBOTTOM;
+        if (x < bdr)                        return HTLEFT;
+        if (x >= w - bdr)                   return HTRIGHT;
+
+        if (y < kTitleBarH) {
+            // Return HTCLIENT for button zones so WM_MOUSEMOVE and
+            // WM_LBUTTONUP fire there; the non-button strip stays HTCAPTION
+            // for native drag support.
+            if (x >= w - kCaptionBtnW * 3)   return HTCLIENT;
+            return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+
+    // Pass -1 as lParam to suppress the default NC-area repaint, which would
+    // briefly flash the OS title bar on focus change.
+    case WM_NCACTIVATE:
+        return DefWindowProc(hwnd, msg, wParam, -1);
 
     case WM_CREATE:
         g_hwnd = hwnd;
@@ -1065,7 +1222,72 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_LBUTTONDBLCLK:
-        ToggleFullscreen(hwnd);
+        // Double-click in the button area or drag strip is handled by the
+        // system (HTCAPTION → maximise/restore) or ignored; only toggle
+        // fullscreen for the video area below the title bar.
+        if (GET_Y_LPARAM(lParam) >= kTitleBarH)
+            ToggleFullscreen(hwnd);
+        return 0;
+
+    case WM_LBUTTONUP: {
+        if (!g_fullscreen) {
+            int bx = GET_X_LPARAM(lParam);
+            int by = GET_Y_LPARAM(lParam);
+            if (by < kTitleBarH) {
+                RECT cr; GetClientRect(hwnd, &cr);
+                int cw = cr.right;
+                if (bx >= cw - kCaptionBtnW) {
+                    PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+                    return 0;
+                }
+                if (bx >= cw - kCaptionBtnW * 2) {
+                    PostMessage(hwnd, WM_SYSCOMMAND,
+                        IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
+                    return 0;
+                }
+                if (bx >= cw - kCaptionBtnW * 3) {
+                    PostMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+                    return 0;
+                }
+            }
+        }
+        break;
+    }
+
+    case WM_MOUSEMOVE: {
+        if (!g_fullscreen) {
+            // Register for WM_MOUSELEAVE so we can clear the hover state
+            if (!g_mouseTracking) {
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+                TrackMouseEvent(&tme);
+                g_mouseTracking = true;
+            }
+            int mx = GET_X_LPARAM(lParam);
+            int my = GET_Y_LPARAM(lParam);
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            int cw = cr.right;
+
+            int newHover = 0;
+            if (my >= 0 && my < kTitleBarH) {
+                if      (mx >= cw - kCaptionBtnW)       newHover = 3;
+                else if (mx >= cw - kCaptionBtnW * 2)   newHover = 2;
+                else if (mx >= cw - kCaptionBtnW * 3)   newHover = 1;
+            }
+            if (newHover != g_hoverBtn) {
+                g_hoverBtn = newHover;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
+        break;  // let DefWindowProc update the cursor
+    }
+
+    case WM_MOUSELEAVE:
+        g_mouseTracking = false;
+        if (g_hoverBtn != 0) {
+            g_hoverBtn = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
 
     case WM_SIZING: {
@@ -1149,6 +1371,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     MFStartup(MF_VERSION);
 
+    // DirectWrite factory + title bar text format (app-lifetime, device-independent)
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_dwFactory.GetAddressOf()));
+    if (g_dwFactory) {
+        g_dwFactory->CreateTextFormat(
+            L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &g_titleFont);
+        if (g_titleFont) {
+            g_titleFont->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            g_titleFont->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+    }
+
     // Register window class
     WNDCLASSEX wc = {};
     wc.cbSize        = sizeof(wc);
@@ -1169,6 +1406,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720,
         nullptr, nullptr, hInstance, nullptr);
+
+    // Tell DWM to extend the frame so the drop-shadow is preserved even though
+    // WM_NCCALCSIZE returns 0 (making the entire window rect the client area).
+    MARGINS shadow = { 1, 1, 1, 1 };
+    DwmExtendFrameIntoClientArea(hwnd, &shadow);
 
     // Restore the last window placement, falling back to the OS default if
     // no saved state exists or the saved rect is entirely off-screen (e.g.
@@ -1262,6 +1504,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     g_swapChain.Reset();
     g_d3dCtx.Reset();
     g_d3dDevice.Reset();
+
+    g_titleFont.Reset();
+    g_dwFactory.Reset();
 
     MFShutdown();
     CoUninitialize();
