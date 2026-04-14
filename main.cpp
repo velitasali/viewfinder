@@ -2,7 +2,7 @@
 // viewfinder — capture card viewer
 // Video: Windows Media Foundation (IMFSourceReader)
 // Audio: WASAPI loopback passthrough (mic → speakers)
-// UI:    Win32 + GDI (StretchDIBits)
+// UI:    Win32 + Direct2D (GPU-scaled, bilinear)
 // Build: cmake -B build -G "Visual Studio 17 2022" && cmake --build build --config Release
 //
 
@@ -23,6 +23,15 @@
 // WRL ComPtr
 #include <wrl/client.h>
 
+// Direct3D 11 + DXGI
+#include <d3d11.h>
+#include <d3d11_4.h>   // ID3D11Multithread
+#include <dxgi1_2.h>
+
+// Direct2D 1.1
+#include <d2d1_1.h>
+#include <d2d1_1helper.h>
+
 #include <string>
 #include <vector>
 #include <thread>
@@ -42,6 +51,9 @@ using Microsoft::WRL::ComPtr;
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -68,12 +80,14 @@ struct DeviceInfo {
     std::wstring id;   // symbolic link (video) or IMMDevice id (audio)
 };
 
-// Shared video frame — written by capture thread, read by WM_PAINT
+// Shared video frame — written by capture thread, read by WM_PAINT.
+// MF decodes into system-memory BGRA; D2D uploads and scales on the GPU.
 struct FrameBuffer {
     std::vector<BYTE> data;
     int   width  = 0;
     int   height = 0;
     LONG  stride = 0;   // MF convention: >0 = top-down, <0 = bottom-up
+
     std::mutex mtx;
 };
 
@@ -94,6 +108,43 @@ static std::atomic<bool>       g_videoRunning{ false };
 static std::thread       g_audioThread;
 static std::atomic<bool> g_audioRunning{ false };
 static std::atomic<bool> g_audioMuted{ false };
+
+// Set to true when a frame is waiting to be painted; cleared in WM_PAINT.
+// Prevents the video thread from flooding the message queue.
+static std::atomic<bool> g_framePending{ false };
+
+// D3D11 + DXGI swap chain
+static ComPtr<ID3D11Device>         g_d3dDevice;
+static ComPtr<ID3D11DeviceContext>  g_d3dCtx;       // immediate context (main-thread only)
+static ComPtr<IDXGISwapChain1>      g_swapChain;
+
+// D2D 1.1 — device context renders directly into the swap chain back buffer
+static ComPtr<ID2D1Factory1>        g_d2dFactory;
+static ComPtr<ID2D1DeviceContext>   g_d2dContext;
+static ComPtr<ID2D1Bitmap1>         g_d2dTarget;   // swap chain back buffer as D2D render target
+
+// CPU-upload BGRA path — used when the camera gives us RGB32 frames.
+static ComPtr<ID2D1Bitmap>          g_swBitmap;
+static D2D1_SIZE_U                  g_swBitmapSize = {};
+static std::vector<BYTE>            g_flipBuffer;    // row-flip buffer for bottom-up frames
+
+// GPU YUV→BGRA path — used when the camera gives us NV12 or YUY2 frames.
+// The capture thread writes the raw YUV bytes into g_frame.data; the render
+// thread uploads them to g_vpInTex, runs ID3D11VideoProcessor to convert into
+// g_vpOutTex (BGRA), then D2D draws g_vpOutTex via g_vpBitmap.
+static ComPtr<ID3D11VideoDevice>              g_vidDev;
+static ComPtr<ID3D11VideoContext>             g_vidCtx;
+static ComPtr<ID3D11VideoProcessorEnumerator> g_vpEnum;
+static ComPtr<ID3D11VideoProcessor>           g_vp;
+static ComPtr<ID3D11Texture2D>                g_vpInTex;
+static ComPtr<ID3D11VideoProcessorInputView>  g_vpInView;
+static ComPtr<ID3D11Texture2D>                g_vpOutTex;
+static ComPtr<ID3D11VideoProcessorOutputView> g_vpOutView;
+static ComPtr<ID2D1Bitmap1>                   g_vpBitmap;
+static DXGI_FORMAT                            g_vpInFmt   = DXGI_FORMAT_UNKNOWN;
+static UINT                                   g_vpInPitch = 0;
+static UINT                                   g_vpW = 0;
+static UINT                                   g_vpH = 0;
 
 // Fullscreen
 static bool             g_fullscreen    = false;
@@ -192,6 +243,10 @@ static std::vector<DeviceInfo> EnumAudioCaptureDevices()
 // forward declaration — defined in "Window aspect ratio helpers" section below
 static void ResizeWindowToAspect(int camW, int camH);
 
+// forward declarations — defined in "D3D11 / D2D helpers" section below
+static bool SetupVideoProcessor(UINT w, UINT h, DXGI_FORMAT inFmt);
+static void ReleaseVideoProcessor();
+
 // ---------------------------------------------------------------------------
 // Video capture
 // ---------------------------------------------------------------------------
@@ -210,19 +265,23 @@ static void VideoThreadProc(ComPtr<IMFSourceReader> reader)
             break;
         if (!pSample) continue;
 
-        ComPtr<IMFMediaBuffer> pBuf;
-        if (FAILED(pSample->ConvertToContiguousBuffer(&pBuf))) continue;
+        // Copy the decoded BGRA pixels into our shared buffer for the renderer.
+        ComPtr<IMFMediaBuffer> pContig;
+        if (FAILED(pSample->ConvertToContiguousBuffer(&pContig))) continue;
 
         BYTE* pData = nullptr; DWORD maxLen, curLen;
-        if (FAILED(pBuf->Lock(&pData, &maxLen, &curLen))) continue;
-
+        if (FAILED(pContig->Lock(&pData, &maxLen, &curLen))) continue;
         {
             std::lock_guard<std::mutex> lk(g_frame.mtx);
-            g_frame.data.assign(pData, pData + curLen);
+            if (g_frame.data.size() != curLen) g_frame.data.resize(curLen);
+            memcpy(g_frame.data.data(), pData, curLen);
         }
-        pBuf->Unlock();
+        pContig->Unlock();
 
-        if (g_hwnd) PostMessage(g_hwnd, WM_NEW_FRAME, 0, 0);
+        // Only post if no paint is already queued — avoids flooding the message queue
+        // when the camera runs faster than the renderer.
+        if (g_hwnd && !g_framePending.exchange(true))
+            PostMessage(g_hwnd, WM_NEW_FRAME, 0, 0);
     }
 }
 
@@ -234,7 +293,9 @@ static bool OpenCamera(int idx)
     g_videoRunning = false;
     if (g_videoThread.joinable()) g_videoThread.join();
     g_videoReader.Reset();
-    { std::lock_guard<std::mutex> lk(g_frame.mtx); g_frame.data.clear(); g_frame.width = g_frame.height = 0; }
+    ReleaseVideoProcessor();
+    { std::lock_guard<std::mutex> lk(g_frame.mtx);
+      g_frame.data.clear(); g_frame.width = g_frame.height = 0; }
 
     // Create source by symbolic link
     ComPtr<IMFAttributes> pSrcAttr;
@@ -247,22 +308,54 @@ static bool OpenCamera(int idx)
     ComPtr<IMFMediaSource> pSource;
     if (FAILED(MFCreateDeviceSource(pSrcAttr.Get(), &pSource))) return false;
 
-    // Create source reader with automatic color conversion
-    ComPtr<IMFAttributes> pReaderAttr;
-    MFCreateAttributes(&pReaderAttr, 1);
-    pReaderAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-
+    // Create source reader with software colour conversion.
+    // We tried MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING (GPU video
+    // processor, zero-copy DXGI samples) but at least one tested capture-card
+    // driver fails inside MF on the second ReadSample (hr=0x80070428,
+    // MF_SOURCE_READERF_ERROR after a ~3-second stall) regardless of how we
+    // release the sample — a driver-side limitation, not a pool-pinning issue
+    // in our code. Software decode + D2D GPU-accelerated scaling is the
+    // reliable path.
     ComPtr<IMFSourceReader> reader;
-    if (FAILED(MFCreateSourceReaderFromMediaSource(pSource.Get(), pReaderAttr.Get(), &reader)))
+    ComPtr<IMFAttributes> pSwAttr;
+    MFCreateAttributes(&pSwAttr, 1);
+    pSwAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    if (FAILED(MFCreateSourceReaderFromMediaSource(pSource.Get(), pSwAttr.Get(), &reader)))
         return false;
 
-    // Request RGB32 output
-    ComPtr<IMFMediaType> pOut;
-    MFCreateMediaType(&pOut);
-    pOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    pOut->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_RGB32);
-    if (FAILED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, pOut.Get())))
-        return false;
+    // Pick the output format. Prefer the camera's native YUV layout (NV12 or
+    // YUY2) so MF does no CPU colour conversion — we convert on the GPU with
+    // ID3D11VideoProcessor. Fall back to RGB32 if neither YUV format is
+    // accepted (MF will then convert in software).
+    GUID        wantSubtype = MFVideoFormat_RGB32;
+    DXGI_FORMAT vpFmt       = DXGI_FORMAT_UNKNOWN;
+    {
+        ComPtr<IMFMediaType> nativeType;
+        GUID ns = {};
+        if (g_vidDev
+            && SUCCEEDED(reader->GetNativeMediaType(
+                           MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &nativeType))
+            && SUCCEEDED(nativeType->GetGUID(MF_MT_SUBTYPE, &ns)))
+        {
+            if      (ns == MFVideoFormat_NV12) { wantSubtype = MFVideoFormat_NV12; vpFmt = DXGI_FORMAT_NV12; }
+            else if (ns == MFVideoFormat_YUY2) { wantSubtype = MFVideoFormat_YUY2; vpFmt = DXGI_FORMAT_YUY2; }
+        }
+    }
+
+    auto setSubtype = [&](const GUID& subtype) -> HRESULT {
+        ComPtr<IMFMediaType> pOut;
+        MFCreateMediaType(&pOut);
+        pOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        pOut->SetGUID(MF_MT_SUBTYPE,    subtype);
+        return reader->SetCurrentMediaType(
+                   MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, pOut.Get());
+    };
+
+    if (FAILED(setSubtype(wantSubtype))) {
+        // YUV attempt failed — retry with RGB32 so we at least get pixels.
+        vpFmt = DXGI_FORMAT_UNKNOWN;
+        if (FAILED(setSubtype(MFVideoFormat_RGB32))) return false;
+    }
 
     // Read actual output type for dimensions / stride
     ComPtr<IMFMediaType> pActual;
@@ -275,8 +368,25 @@ static bool OpenCamera(int idx)
     LONG   stride    = 0;
     if (SUCCEEDED(pActual->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideRaw)))
         stride = static_cast<LONG>(strideRaw);
-    else
+    else if (vpFmt == DXGI_FORMAT_UNKNOWN)
         stride = static_cast<LONG>(w * 4);   // assume top-down RGB32
+    else if (vpFmt == DXGI_FORMAT_YUY2)
+        stride = static_cast<LONG>(w * 2);
+    else
+        stride = static_cast<LONG>(w);       // NV12 Y-plane pitch
+
+    // If we locked in a YUV format, build the GPU conversion pipeline. If that
+    // fails (unlikely on any D3D11 GPU), fall back to RGB32.
+    if (vpFmt != DXGI_FORMAT_UNKNOWN && !SetupVideoProcessor(w, h, vpFmt)) {
+        vpFmt = DXGI_FORMAT_UNKNOWN;
+        if (FAILED(setSubtype(MFVideoFormat_RGB32))) return false;
+        reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pActual);
+        MFGetAttributeSize(pActual.Get(), MF_MT_FRAME_SIZE, &w, &h);
+        if (SUCCEEDED(pActual->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideRaw)))
+            stride = static_cast<LONG>(strideRaw);
+        else
+            stride = static_cast<LONG>(w * 4);
+    }
 
     {
         std::lock_guard<std::mutex> lk(g_frame.mtx);
@@ -381,10 +491,16 @@ static void AudioThreadProc(std::wstring captureId)
     pCapClient->GetMixFormat(&pCapFmt);
 
     constexpr REFERENCE_TIME kBufDur = 400000; // 40 ms
-    if (FAILED(pCapClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+    if (FAILED(pCapClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                       AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                        kBufDur, 0, pCapFmt, nullptr))) {
         CoTaskMemFree(pCapFmt); CoUninitialize(); return;
     }
+
+    // Event-driven: the audio engine signals this when a buffer is ready,
+    // so the thread sleeps instead of polling every 10 ms.
+    HANDLE hCapEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    pCapClient->SetEventHandle(hCapEvent);
 
     ComPtr<IAudioCaptureClient> pCapture;
     pCapClient->GetService(IID_PPV_ARGS(&pCapture));
@@ -431,7 +547,8 @@ static void AudioThreadProc(std::wstring captureId)
     pRendClient->Start();
 
     while (g_audioRunning) {
-        Sleep(10);
+        // Sleep until the capture device signals a buffer is ready (or 200 ms timeout).
+        WaitForSingleObject(hCapEvent, 200);
 
         UINT32 packetFrames = 0;
         while (SUCCEEDED(pCapture->GetNextPacketSize(&packetFrames)) && packetFrames > 0) {
@@ -470,6 +587,7 @@ static void AudioThreadProc(std::wstring captureId)
 
     pCapClient->Stop();
     pRendClient->Stop();
+    CloseHandle(hCapEvent);
     CoTaskMemFree(pCapFmt);
     CoTaskMemFree(pRendFmt);
     CoUninitialize();
@@ -563,70 +681,245 @@ static void ToggleFullscreen(HWND hwnd)
 }
 
 // ---------------------------------------------------------------------------
+// D3D11 / D2D helpers
+// ---------------------------------------------------------------------------
+
+// Release per-frame and back-buffer resources (called on resize and shutdown).
+// Does NOT release the factory, D3D device, or swap chain — only surface-bound objects.
+static void DiscardD2DResources()
+{
+    g_swBitmap.Reset();
+    g_swBitmapSize = {};
+    g_d2dTarget.Reset();
+    if (g_d2dContext) g_d2dContext->SetTarget(nullptr);
+}
+
+// Release all GPU-conversion resources tied to a specific camera configuration.
+// Called when switching cameras or shutting down.
+static void ReleaseVideoProcessor()
+{
+    g_vpBitmap.Reset();
+    g_vpOutView.Reset(); g_vpOutTex.Reset();
+    g_vpInView.Reset();  g_vpInTex.Reset();
+    g_vp.Reset();        g_vpEnum.Reset();
+    g_vpInFmt   = DXGI_FORMAT_UNKNOWN;
+    g_vpInPitch = 0;
+    g_vpW = g_vpH = 0;
+}
+
+// Build a D3D11 video processor that converts `inFmt` (NV12/YUY2) at `w`×`h`
+// into a same-sized BGRA texture, plus a D2D bitmap view of that BGRA texture
+// so the renderer can DrawBitmap it. Returns false on failure (caller should
+// fall back to the CPU RGB32 path).
+static bool SetupVideoProcessor(UINT w, UINT h, DXGI_FORMAT inFmt)
+{
+    if (!g_vidDev || !g_d3dDevice || !g_d2dContext) return false;
+    ReleaseVideoProcessor();
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
+    cd.InputFrameFormat          = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    cd.InputFrameRate.Numerator  = 60; cd.InputFrameRate.Denominator  = 1;
+    cd.InputWidth                = w;  cd.InputHeight                 = h;
+    cd.OutputFrameRate.Numerator = 60; cd.OutputFrameRate.Denominator = 1;
+    cd.OutputWidth               = w;  cd.OutputHeight                = h;
+    cd.Usage                     = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    if (FAILED(g_vidDev->CreateVideoProcessorEnumerator(&cd, &g_vpEnum)))  goto fail;
+    if (FAILED(g_vidDev->CreateVideoProcessor(g_vpEnum.Get(), 0, &g_vp))) goto fail;
+
+    {
+        // Input texture — YUV. UpdateSubresource writes into this every frame.
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width              = w;
+        td.Height             = h;
+        td.MipLevels          = 1;
+        td.ArraySize          = 1;
+        td.Format             = inFmt;
+        td.SampleDesc.Count   = 1;
+        td.Usage              = D3D11_USAGE_DEFAULT;
+        td.BindFlags          = 0;       // video processor input needs no bind
+        if (FAILED(g_d3dDevice->CreateTexture2D(&td, nullptr, &g_vpInTex))) goto fail;
+
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+        ivd.ViewDimension            = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivd.Texture2D.MipSlice       = 0;
+        ivd.Texture2D.ArraySlice     = 0;
+        if (FAILED(g_vidDev->CreateVideoProcessorInputView(
+                       g_vpInTex.Get(), g_vpEnum.Get(), &ivd, &g_vpInView))) goto fail;
+
+        // Output texture — BGRA. D2D draws from this.
+        td.Format    = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_d3dDevice->CreateTexture2D(&td, nullptr, &g_vpOutTex))) goto fail;
+
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+        ovd.ViewDimension         = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        ovd.Texture2D.MipSlice    = 0;
+        if (FAILED(g_vidDev->CreateVideoProcessorOutputView(
+                       g_vpOutTex.Get(), g_vpEnum.Get(), &ovd, &g_vpOutView))) goto fail;
+    }
+
+    // Wrap the BGRA output texture as a D2D bitmap for DrawBitmap.
+    {
+        ComPtr<IDXGISurface> surf;
+        if (FAILED(g_vpOutTex.As(&surf))) goto fail;
+        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        if (FAILED(g_d2dContext->CreateBitmapFromDxgiSurface(
+                       surf.Get(), &bp, &g_vpBitmap))) goto fail;
+    }
+
+    // Colour-space hints. 1080p-class capture is typically BT.709 limited range;
+    // treat anything 720p+ as 709 and smaller as 601. RGB output is full-range.
+    {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inCs = {};
+        inCs.YCbCr_Matrix  = (h >= 720) ? 1 : 0;   // 0=BT601, 1=BT709
+        inCs.Nominal_Range = 1;                    // 1=16-235 (limited)
+        g_vidCtx->VideoProcessorSetStreamColorSpace(g_vp.Get(), 0, &inCs);
+
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE outCs = {};
+        outCs.RGB_Range = 0;                       // 0=full-range RGB
+        g_vidCtx->VideoProcessorSetOutputColorSpace(g_vp.Get(), &outCs);
+    }
+
+    g_vpInFmt   = inFmt;
+    g_vpW       = w;
+    g_vpH       = h;
+    // UpdateSubresource pitch:
+    //   YUY2 is packed 4:2:2, 2 bytes/pixel → pitch = w*2.
+    //   NV12 is planar — Y plane then interleaved UV. Pitch applies to both.
+    g_vpInPitch = (inFmt == DXGI_FORMAT_YUY2) ? (w * 2) : w;
+    return true;
+
+fail:
+    ReleaseVideoProcessor();
+    return false;
+}
+
+// (Re)bind the D2D device context to the current swap chain back buffer.
+// Call once after swap chain creation and again after ResizeBuffers.
+static bool SetupSwapChainTarget()
+{
+    if (!g_swapChain || !g_d2dContext) return false;
+    DiscardD2DResources();
+
+    ComPtr<IDXGISurface> backBuf;
+    if (FAILED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuf.GetAddressOf())))) return false;
+
+    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    if (FAILED(g_d2dContext->CreateBitmapFromDxgiSurface(backBuf.Get(), &props, &g_d2dTarget)))
+        return false;
+
+    g_d2dContext->SetTarget(g_d2dTarget.Get());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
-static void RenderFrame(HDC hdc, int cw, int ch)
+// Shared letterbox calculation — returns dest rect given source and target sizes.
+static D2D1_RECT_F Letterbox(float srcW, float srcH, float rtW, float rtH)
 {
-    std::lock_guard<std::mutex> lk(g_frame.mtx);
+    float sc = (rtW / srcW < rtH / srcH) ? rtW / srcW : rtH / srcH;
+    float dw = srcW * sc, dh = srcH * sc;
+    float dx = (rtW - dw) * 0.5f, dy = (rtH - dh) * 0.5f;
+    return D2D1::RectF(dx, dy, dx + dw, dy + dh);
+}
 
-    RECT rc = { 0, 0, cw, ch };
+static void RenderFrame(HWND /*hwnd*/)
+{
+    if (!g_d2dContext || !g_d2dTarget) return;
 
-    if (g_frame.data.empty() || g_frame.width == 0) {
-        FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    g_d2dContext->BeginDraw();
+    g_d2dContext->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f));
 
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(80, 80, 80));
-        HFONT hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT old = static_cast<HFONT>(SelectObject(hdc, hFont));
-        DrawText(hdc, L"Right-click to select a camera", -1, &rc,
-                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdc, old);
-        DeleteObject(hFont);
-        return;
+    bool drawn = false;
+
+    // ── GPU YUV→BGRA path ─────────────────────────────────────────────────
+    // Camera gave us NV12/YUY2. Upload to g_vpInTex, run the video processor
+    // to convert into g_vpOutTex (BGRA), then D2D draws g_vpOutTex via g_vpBitmap.
+    if (g_vpBitmap && g_vpInTex && g_vidCtx && g_d3dCtx) {
+        std::lock_guard<std::mutex> lk(g_frame.mtx);
+        if (!g_frame.data.empty()) {
+            g_d3dCtx->UpdateSubresource(
+                g_vpInTex.Get(), 0, nullptr,
+                g_frame.data.data(), g_vpInPitch, 0);
+
+            RECT rect = { 0, 0, (LONG)g_vpW, (LONG)g_vpH };
+            g_vidCtx->VideoProcessorSetStreamSourceRect(g_vp.Get(), 0, TRUE, &rect);
+            g_vidCtx->VideoProcessorSetStreamDestRect  (g_vp.Get(), 0, TRUE, &rect);
+            g_vidCtx->VideoProcessorSetOutputTargetRect(g_vp.Get(),    TRUE, &rect);
+
+            D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+            stream.Enable         = TRUE;
+            stream.OutputIndex    = 0;
+            stream.InputFrameOrField = 0;
+            stream.pInputSurface  = g_vpInView.Get();
+            if (SUCCEEDED(g_vidCtx->VideoProcessorBlt(
+                    g_vp.Get(), g_vpOutView.Get(), 0, 1, &stream)))
+            {
+                D2D1_SIZE_F bsz  = g_vpBitmap->GetSize();
+                D2D1_SIZE_F rtsz = g_d2dContext->GetSize();
+                g_d2dContext->DrawBitmap(g_vpBitmap.Get(),
+                    Letterbox(bsz.width, bsz.height, rtsz.width, rtsz.height),
+                    1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
+                drawn = true;
+            }
+        }
     }
 
-    const int fw = g_frame.width;
-    const int fh = g_frame.height;
+    // ── CPU BGRA path ─────────────────────────────────────────────────────
+    // Camera gave us RGB32 (or GPU path wasn't set up). Upload each frame to
+    // a D2D bitmap via CopyFromMemory and draw it letterboxed.
+    if (!drawn) {
+        std::lock_guard<std::mutex> lk(g_frame.mtx);
+        const int fw = g_frame.width, fh = g_frame.height;
 
-    // Letterbox: scale to fit, centered
-    const float sx    = static_cast<float>(cw) / fw;
-    const float sy    = static_cast<float>(ch) / fh;
-    const float scale = (sx < sy) ? sx : sy;
-    const int dw = static_cast<int>(fw * scale);
-    const int dh = static_cast<int>(fh * scale);
-    const int dx = (cw - dw) / 2;
-    const int dy = (ch - dh) / 2;
+        if (!g_frame.data.empty() && fw > 0 && fh > 0) {
+            const LONG   absStride = std::abs(g_frame.stride);
+            const UINT32 pitch     = static_cast<UINT32>(absStride);
 
-    // Black letterbox bars
-    if (dx > 0) {
-        RECT bar = { 0, 0, dx, ch };           FillRect(hdc, &bar, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        bar = { dx + dw, 0, cw, ch };          FillRect(hdc, &bar, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            if (!g_swBitmap ||
+                g_swBitmapSize.width  != static_cast<UINT32>(fw) ||
+                g_swBitmapSize.height != static_cast<UINT32>(fh))
+            {
+                g_swBitmap.Reset();
+                D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8X8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+                D2D1_SIZE_U sz = D2D1::SizeU(static_cast<UINT32>(fw), static_cast<UINT32>(fh));
+                if (SUCCEEDED(g_d2dContext->CreateBitmap(sz, bp, &g_swBitmap)))
+                    g_swBitmapSize = sz;
+            }
+
+            if (g_swBitmap) {
+                const BYTE* src = g_frame.data.data();
+                if (g_frame.stride < 0) {
+                    const size_t rb = static_cast<size_t>(absStride);
+                    g_flipBuffer.resize(rb * fh);
+                    const BYTE* s = src + (fh - 1) * rb;
+                    BYTE* d = g_flipBuffer.data();
+                    for (int y = 0; y < fh; y++, s -= rb, d += rb)
+                        memcpy(d, s, rb);
+                    src = g_flipBuffer.data();
+                }
+                g_swBitmap->CopyFromMemory(nullptr, src, pitch);
+
+                D2D1_SIZE_F sz = g_swBitmap->GetSize();
+                D2D1_SIZE_F rtsz = g_d2dContext->GetSize();
+                g_d2dContext->DrawBitmap(g_swBitmap.Get(),
+                    Letterbox(sz.width, sz.height, rtsz.width, rtsz.height),
+                    1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
+            }
+        }
     }
-    if (dy > 0) {
-        RECT bar = { 0, 0, cw, dy };           FillRect(hdc, &bar, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        bar = { 0, dy + dh, cw, ch };          FillRect(hdc, &bar, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-    }
 
-    // MF stride convention: >0 = top-down, <0 = bottom-up
-    // GDI biHeight:         <0 = top-down, >0 = bottom-up
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = fw;
-    bmi.bmiHeader.biHeight      = (g_frame.stride >= 0) ? -fh : fh;
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    HRESULT hr = g_d2dContext->EndDraw();
+    if (FAILED(hr)) DiscardD2DResources();
 
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, nullptr);
-    StretchDIBits(hdc,
-                  dx, dy, dw, dh,
-                  0,  0,  fw, fh,
-                  g_frame.data.data(), &bmi,
-                  DIB_RGB_COLORS, SRCCOPY);
+    if (g_swapChain) g_swapChain->Present(0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -689,10 +982,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_PAINT: {
+        g_framePending = false;   // allow the next frame to queue a new paint
         PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        RECT cr; GetClientRect(hwnd, &cr);
-        RenderFrame(hdc, cr.right, cr.bottom);
+        BeginPaint(hwnd, &ps);   // validates dirty region; D2D draws to the HWND directly
+        RenderFrame(hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -787,14 +1080,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return TRUE;
     }
 
-    case WM_SIZE:
+    case WM_SIZE: {
+        UINT w = LOWORD(lParam), h = HIWORD(lParam);
+        if (w > 0 && h > 0 && g_swapChain) {
+            // Release back-buffer references before resizing the swap chain.
+            DiscardD2DResources();
+            g_swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+            SetupSwapChainTarget();
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+    }
 
     case WM_DESTROY:
         g_hwnd = nullptr;
         g_videoRunning = false;
         g_audioRunning = false;
+        DiscardD2DResources();
         PostQuitMessage(0);
         return 0;
     }
@@ -836,6 +1138,50 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
+    // ── D3D11 device ──────────────────────────────────────────────────────────
+    // BGRA_SUPPORT is required for D2D interop.
+    // VIDEO_SUPPORT is required for ID3D11VideoDevice / VideoProcessor.
+    D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                      D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                      nullptr, 0, D3D11_SDK_VERSION,
+                      &g_d3dDevice, nullptr, &g_d3dCtx);
+
+    if (g_d3dDevice) {
+        // Video device/context for GPU-side colour conversion (NV12/YUY2 → BGRA).
+        g_d3dDevice->QueryInterface(IID_PPV_ARGS(g_vidDev.GetAddressOf()));
+        if (g_d3dCtx) g_d3dCtx->QueryInterface(IID_PPV_ARGS(g_vidCtx.GetAddressOf()));
+
+        // ── DXGI swap chain ───────────────────────────────────────────────────
+        ComPtr<IDXGIDevice1>  dxgiDev;
+        ComPtr<IDXGIAdapter>  dxgiAdapter;
+        ComPtr<IDXGIFactory2> dxgiFactory;
+        g_d3dDevice->QueryInterface(IID_PPV_ARGS(dxgiDev.GetAddressOf()));
+        dxgiDev->GetAdapter(&dxgiAdapter);
+        dxgiAdapter->GetParent(IID_PPV_ARGS(dxgiFactory.GetAddressOf()));
+
+        DXGI_SWAP_CHAIN_DESC1 scd = {};
+        scd.Format      = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.SampleDesc  = { 1, 0 };
+        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.BufferCount = 2;
+        scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        dxgiFactory->CreateSwapChainForHwnd(g_d3dDevice.Get(), hwnd,
+                                             &scd, nullptr, nullptr, &g_swapChain);
+
+        // ── D2D 1.1 factory → device → device context ────────────────────────
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                          g_d2dFactory.GetAddressOf());
+
+        ComPtr<ID2D1Device> d2dDev;
+        g_d2dFactory->CreateDevice(dxgiDev.Get(), &d2dDev);
+        d2dDev->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_d2dContext);
+
+        // Use pixel units so our coordinates map 1:1 to physical swap-chain pixels.
+        if (g_d2dContext) g_d2dContext->SetDpi(96.0f, 96.0f);
+
+        SetupSwapChainTarget();
+    }
+
     // Open first available camera and mic
     g_cameras = EnumVideoDevices();
     g_mics    = EnumAudioCaptureDevices();
@@ -849,12 +1195,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         DispatchMessage(&msg);
     }
 
-    // Cleanup — stop threads before COM teardown
+    // Cleanup — stop threads before COM/D3D teardown
     g_videoRunning = false;
     g_audioRunning = false;
     if (g_videoThread.joinable()) g_videoThread.join();
     if (g_audioThread.joinable()) g_audioThread.join();
     g_videoReader.Reset();
+
+    DiscardD2DResources();
+    ReleaseVideoProcessor();
+    g_vidCtx.Reset();
+    g_vidDev.Reset();
+    g_d2dContext.Reset();
+    g_d2dFactory.Reset();
+    g_swapChain.Reset();
+    g_d3dCtx.Reset();
+    g_d3dDevice.Reset();
 
     MFShutdown();
     CoUninitialize();

@@ -68,7 +68,30 @@ The resulting executable is at `build\Release\viewfinder.exe`.
 | Layer | API |
 |---|---|
 | Video capture | Windows Media Foundation (`IMFSourceReader`) |
+| Colour conversion | Direct3D 11 Video Processor (`ID3D11VideoProcessor`) |
+| Rendering | Direct2D 1.1 (`ID2D1DeviceContext`, `ID2D1Bitmap1`) |
 | Audio passthrough | WASAPI (`IAudioCaptureClient` → `IAudioRenderClient`) |
-| Rendering | GDI (`StretchDIBits`) |
 | Window / UI | Win32 |
 | Installer | Inno Setup 6 |
+
+## Rendering pipeline
+
+```
+Capture card (NV12 / YUY2)
+    │  Windows Media Foundation — software decode
+    ▼
+CPU buffer (YUV bytes)
+    │  UpdateSubresource → D3D11 input texture
+    ▼
+ID3D11VideoProcessor  ←  colour space: BT.601 limited→full
+    │  VideoProcessorBlt → BGRA output texture
+    ▼
+ID2D1Bitmap1 (DXGI surface)
+    │  DrawBitmap
+    ▼
+IDXGISwapChain1  →  screen
+```
+
+Media Foundation reads frames from the capture card in the card's native YUV format (NV12 or YUY2) when available, falling back to RGB32. If a YUV format is chosen, a `ID3D11VideoProcessor` converts it to BGRA entirely on the GPU before handing it to Direct2D, keeping CPU usage low. The final blit is hardware-accelerated through the DXGI swap chain.
+
+Hardware-accelerated decode through the MF DXVA pipeline (`MF_SOURCE_READER_D3D_MANAGER`) was evaluated but found to be unreliable for uncompressed capture-card sources: the driver returns `ERROR_EXCEPTION_IN_SERVICE` on the second `ReadSample` call, causing the preview to stall. Software decode with GPU colour conversion is the practical optimum for this class of device.
