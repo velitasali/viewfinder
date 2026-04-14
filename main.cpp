@@ -650,6 +650,40 @@ static void ResizeWindowToAspect(int camW, int camH)
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// ---------------------------------------------------------------------------
+// Window placement persistence (registry)
+// ---------------------------------------------------------------------------
+
+static void SaveWindowPlacement(HWND hwnd)
+{
+    WINDOWPLACEMENT wp = { sizeof(wp) };
+    if (!GetWindowPlacement(hwnd, &wp)) return;
+
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Viewfinder",
+                        0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(hKey, L"WindowPlacement", 0, REG_BINARY,
+                   reinterpret_cast<const BYTE*>(&wp), sizeof(wp));
+    RegCloseKey(hKey);
+}
+
+static bool LoadWindowPlacement(WINDOWPLACEMENT& wp)
+{
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Viewfinder",
+                      0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+        return false;
+
+    DWORD size = sizeof(wp);
+    DWORD type = REG_BINARY;
+    bool ok = RegQueryValueExW(hKey, L"WindowPlacement", nullptr, &type,
+                               reinterpret_cast<BYTE*>(&wp), &size) == ERROR_SUCCESS
+              && type == REG_BINARY && size == sizeof(wp) && wp.length == sizeof(wp);
+    RegCloseKey(hKey);
+    return ok;
+}
+
 // Toggle between windowed and borderless fullscreen on whichever monitor
 // the window currently occupies.
 static void ToggleFullscreen(HWND hwnd)
@@ -1093,6 +1127,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_DESTROY:
+        SaveWindowPlacement(hwnd);
         g_hwnd = nullptr;
         g_videoRunning = false;
         g_audioRunning = false;
@@ -1135,7 +1170,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720,
         nullptr, nullptr, hInstance, nullptr);
 
-    ShowWindow(hwnd, nCmdShow);
+    // Restore the last window placement, falling back to the OS default if
+    // no saved state exists or the saved rect is entirely off-screen (e.g.
+    // after disconnecting a monitor).
+    {
+        WINDOWPLACEMENT wp = { sizeof(wp) };
+        if (LoadWindowPlacement(wp) &&
+            MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONULL) != nullptr)
+        {
+            if (wp.showCmd == SW_SHOWMINIMIZED) wp.showCmd = SW_SHOWNORMAL;
+            SetWindowPlacement(hwnd, &wp);
+            ShowWindow(hwnd, wp.showCmd);
+        }
+        else
+        {
+            ShowWindow(hwnd, nCmdShow);
+        }
+    }
     UpdateWindow(hwnd);
 
     // ── D3D11 device ──────────────────────────────────────────────────────────

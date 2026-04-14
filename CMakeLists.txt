@@ -21,7 +21,7 @@ target_compile_options(viewfinder PRIVATE
 target_link_libraries(viewfinder PRIVATE
     mf mfplat mfreadwrite mfuuid
     ole32 oleaut32 propsys
-    user32 gdi32 d2d1 d3d11 dxgi
+    user32 gdi32 d2d1 d3d11 dxgi advapi32
 )
 
 # Remove console window and merge CRT for smaller binary

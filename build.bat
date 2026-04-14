@@ -40,7 +40,7 @@ cl.exe ^
   /link /SUBSYSTEM:WINDOWS ^
   mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
   ole32.lib oleaut32.lib propsys.lib ^
-  user32.lib gdi32.lib d2d1.lib d3d11.lib dxgi.lib
+  user32.lib gdi32.lib d2d1.lib d3d11.lib dxgi.lib advapi32.lib
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
